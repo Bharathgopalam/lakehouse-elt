@@ -1,76 +1,53 @@
-# Lakehouse ELT
+# lakehouse-elt
 
-A small but complete **medallion-architecture** data pipeline built on DuckDB and Parquet:
-raw JSON events are ingested to **bronze**, cleaned and merged into **silver**, and aggregated into
-**gold** tables, with data-quality gates and a DAG runner coordinating the steps.
+A learning project where I practice the Bronze / Silver / Gold (medallion) pattern on a small scale.
+At work I used Azure Data Factory and Snowflake, so I wanted to see the same ideas without a cloud bill:
+everything here runs locally with Python, DuckDB and Parquet files.
 
-The input data is **synthetic** (deterministic, seeded) and deliberately messy. It includes late
-status updates, duplicates, malformed JSON, negative quantities and inconsistent casing, so every
-stage has real work to do.
+The input is fake order data that I generate with a script. It is messy on purpose: duplicate events,
+late status updates, broken JSON lines, negative quantities, and mixed upper/lower case, so each layer
+has something to fix.
+
+## How it flows
 
 ```
-landing/dt=*/orders.jsonl
-        |  ingest_bronze   raw text + lineage, append-only, one Parquet partition per day
-        v
-bronze/orders/ingest_date=*/data.parquet
-        |  build_silver    typed, cleaned, deduped; incremental via watermark
-        v                  invalid rows -> silver/orders_rejects.parquet (with reason)
-silver/orders.parquet
-        |  quality_checks  gate: failure stops everything downstream
-        v
-        |  build_gold      daily_revenue, top_products, customer_summary, status_funnel
-        v
-gold/*.parquet  --> reconcile_gold (gold revenue must equal silver revenue)
+landing (json files per day)
+   -> bronze   raw text + where it came from, one Parquet folder per day
+   -> silver   typed, cleaned, one row per order, bad rows go to a rejects table
+   -> quality checks (if these fail, the run stops)
+   -> gold     daily revenue, top products, customer summary, status funnel
 ```
 
-## Run it
+## Running it
 
 ```bash
 pip install -r requirements-dev.txt
 python -m lakehouse generate --days 5 --orders 200 --start 2026-10-01
 python -m lakehouse run
 python -m lakehouse query "SELECT order_date, orders, revenue FROM daily_revenue"
-python -m lakehouse query "SELECT reject_reason, COUNT(*) FROM rejects GROUP BY 1"
 python -m pytest
 ```
 
-`query` exposes views named `bronze`, `silver`, `rejects`, and each gold table. Data lives in `./data`
-(override with `--root`).
+## Things I focused on
 
-## Key design decisions
+- Bronze keeps everything as text, so a bad value can't break ingestion. Types are applied in silver.
+- Re-running is safe: a day that's already in bronze is skipped.
+- Silver keeps the newest event for each order, so a late update can't overwrite a newer status.
+- Silver only processes new days (it stores the last processed day in a small state file).
+- Bad rows are not dropped silently. They go to a rejects table with the reason.
+- Gold totals are checked against silver so I know the aggregations add up.
 
-| Decision | Why |
-|----------|-----|
-| Bronze stores everything as text | A bad cast can never destroy raw data; typing happens in silver |
-| One bronze partition per landing day, skipped if present | Ingestion is idempotent; re-running is safe |
-| Silver keeps the latest `event_ts` per order | Correct under late and out-of-order events |
-| Silver tracks a watermark in `state.json` | Only new partitions are processed (incremental) |
-| Rejected rows go to a quarantine table with a reason | Nothing disappears silently; bad data stays debuggable |
-| Quality gate between silver and gold | Bad data never reaches consumers |
-| Gold reconciliation against silver | Catches aggregation bugs |
-| `QualityError` is never retried | Retrying a deterministic failure only wastes time |
+## What's missing / what I'd change
 
-## Project layout
+- It runs on one machine and rewrites silver every time. On real data volumes I'd partition silver and
+  only merge the changed days, or use Delta Lake / Iceberg.
+- The "last processed day" logic assumes days arrive in order.
+- There's an Airflow DAG file in `dags/` to show how the steps would map to Airflow, but I haven't run it
+  in Airflow yet.
+- The data is synthetic.
 
-```
-lakehouse/        config, generate, bronze, silver, gold, quality, runner, pipeline, cli
-dags/             reference Airflow DAG (not executed by the tests)
-tests/            22 tests: each layer, the DAG runner, and end-to-end runs
-```
+## Next things I want to try
 
-## Honest limitations
-
-- Single machine. Silver is fully rewritten on each incremental run (fine for this size; at scale you
-  would partition silver and merge only affected partitions, or use Delta Lake / Iceberg).
-- The watermark is partition-based, so it assumes bronze partitions arrive in date order.
-- `dags/lakehouse_dag.py` shows the Airflow mapping but was not run in this repo.
-- Data is synthetic. Do not present it as production data.
-
-## Ideas to extend it
-
-1. Replace the JSON state file with a table, or add run metadata (rows in/out per run).
-2. Add a `dim_customer` with SCD Type 2 history.
-3. Partition silver by `order_date` and merge only changed partitions.
-4. Swap the local filesystem for S3 using DuckDB's `httpfs`.
-5. Add schema-drift detection for new or renamed columns in landing files.
-6. Expose gold tables through the API project's style of service, or a small dashboard.
+- Add a customer dimension with SCD Type 2 history
+- Read and write from S3 instead of local files
+- Detect new or renamed columns in the landing files
